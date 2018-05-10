@@ -112,6 +112,7 @@ struct GBA {
 	int32_t cachedRegisters[16];
 	bool taintedRegisters[16];
 
+	bool realisticTiming;
 	bool hardCrash;
 	bool allowOpposingDirections;
 

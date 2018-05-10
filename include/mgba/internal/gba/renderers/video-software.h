@@ -47,8 +47,6 @@ struct GBAVideoSoftwareBackground {
 	uint16_t mapCache[64];
 	color_t* extPalette;
 	color_t* variantPalette;
-	int32_t offsetX;
-	int32_t offsetY;
 };
 
 enum BlendEffect {
@@ -170,8 +168,6 @@ struct GBAVideoSoftwareRenderer {
 	struct GBAVideoSoftwareSprite sprites[128];
 	int tileStride;
 	int bitmapStride;
-	int16_t objOffsetX;
-	int16_t objOffsetY;
 	bool combinedObjSort;
 
 	uint32_t scanlineDirty[5];

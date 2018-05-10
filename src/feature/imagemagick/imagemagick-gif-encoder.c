@@ -102,10 +102,10 @@ static void _magickPostVideoFrame(struct mAVStream* stream, const color_t* pixel
 
 static void _magickVideoDimensionsChanged(struct mAVStream* stream, unsigned width, unsigned height) {
 	struct ImageMagickGIFEncoder* encoder = (struct ImageMagickGIFEncoder*) stream;
-	if (width * height > encoder->iwidth * encoder->iheight) {
-		free(encoder->frame);
-		encoder->frame = malloc(width * height * 4);
+	if (encoder->iwidth == width && encoder->iheight == height) {
+		return;
 	}
+	free(encoder->frame);
 	encoder->iwidth = width;
 	encoder->iheight = height;
 	encoder->frame = malloc(encoder->iwidth * encoder->iheight * 4);

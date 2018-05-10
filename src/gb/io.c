@@ -106,29 +106,13 @@ static const uint8_t _registerMask[] = {
 
 static void _writeSGBBits(struct GB* gb, int bits) {
 	if (!bits) {
-		gb->sgbBit = -1;
+		gb->sgbBit = 0;
 		memset(gb->sgbPacket, 0, sizeof(gb->sgbPacket));
 	}
 	if (bits == gb->currentSgbBits) {
 		return;
 	}
 	gb->currentSgbBits = bits;
-	if (gb->sgbBit > 128) {
-		switch (bits) {
-		case 1:
-			gb->sgbBit |= 2;
-			break;
-		case 2:
-			gb->sgbBit |= 4;
-			break;
-		case 3:
-			if (gb->sgbBit == 135) {
-				gb->sgbBit &= ~6;
-				gb->sgbCurrentController = (gb->sgbCurrentController + 1) & gb->sgbControllers;
-			}
-			break;
-		}
-	}
 	if (gb->sgbBit == 128 && bits == 2) {
 		GBVideoWriteSGBPacket(&gb->video, gb->sgbPacket);
 		++gb->sgbBit;
@@ -138,12 +122,9 @@ static void _writeSGBBits(struct GB* gb, int bits) {
 	}
 	switch (bits) {
 	case 1:
-		if (gb->sgbBit < 0) {
-			return;
-		}
 		gb->sgbPacket[gb->sgbBit >> 3] |= 1 << (gb->sgbBit & 7);
-		break;
-	case 3:
+		// Fall through
+	case 2:
 		++gb->sgbBit;
 	default:
 		break;
@@ -399,17 +380,8 @@ void GBIOWrite(struct GB* gb, unsigned address, uint8_t value) {
 		}
 		break;
 	case REG_TIMA:
-		if (value && mTimingUntil(&gb->timing, &gb->timer.irq) > 1) {
-			mTimingDeschedule(&gb->timing, &gb->timer.irq);
-		}
-		if (mTimingUntil(&gb->timing, &gb->timer.irq) == -1) {
-			return;
-		}
-		break;
 	case REG_TMA:
-		if (mTimingUntil(&gb->timing, &gb->timer.irq) == -1) {
-			gb->memory.io[REG_TIMA] = value;
-		}
+		// Handled transparently by the registers
 		break;
 	case REG_TAC:
 		value = GBTimerUpdateTAC(&gb->timer, value);
@@ -519,12 +491,10 @@ void GBIOWrite(struct GB* gb, unsigned address, uint8_t value) {
 
 static uint8_t _readKeys(struct GB* gb) {
 	uint8_t keys = *gb->keySource;
-	if (gb->sgbCurrentController != 0) {
-		keys = 0;
-	}
 	switch (gb->memory.io[REG_JOYP] & 0x30) {
 	case 0x30:
-		keys = gb->sgbCurrentController;
+	// TODO: Increment
+		keys = (gb->video.sgbCommandHeader >> 3) == SGB_MLT_REG ? 0xF : 0;
 		break;
 	case 0x20:
 		keys >>= 4;

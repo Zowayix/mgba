@@ -89,10 +89,8 @@ class PerfServer(object):
         else:
             server_command = [os.path.join(os.getcwd(), PerfTest.EXECUTABLE)]
         server_command.extend(['--', '-PD', '0'])
-        if hasattr(test, "frames"):
-            server_command.extend(['-F', str(test.frames)])
-        if test.renderer != "software":
-            server_command.append('-N')
+        if (hasattr(test, "frames")):
+                server_command.extend(['-F', str(test.frames)])
         subprocess.check_call(server_command)
         time.sleep(4)
         self.socket = socket.create_connection(self.address, timeout=1000)

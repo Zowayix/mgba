@@ -19,12 +19,8 @@ static void _readPins(struct GBACartridgeHardware* hw);
 static void _outputPins(struct GBACartridgeHardware* hw, unsigned pins);
 
 static void _rtcReadPins(struct GBACartridgeHardware* hw);
-static unsigned _rtcOutput(struct GBACartridgeHardware* hw);
-static void _rtcProcessByte(struct GBACartridgeHardware* hw);
-static void _rtcUpdateClock(struct GBACartridgeHardware* hw);
+static void _rtcUpdateClock(struct GBARTC* rtc, struct mRTCSource*);
 static unsigned _rtcBCD(unsigned value);
-
-static time_t _rtcGenericCallback(struct mRTCSource* source);
 
 static void _gyroReadPins(struct GBACartridgeHardware* hw);
 
@@ -37,14 +33,14 @@ static uint16_t _gbpSioWriteRegister(struct GBASIODriver* driver, uint32_t addre
 static void _gbpSioProcessEvents(struct mTiming* timing, void* user, uint32_t cyclesLate);
 
 static const int RTC_BYTES[8] = {
-	0, // Force reset
-	0, // Empty
+	1, // Status register 1
+	1, // Duty/alarm 1
 	7, // Date/Time
-	0, // Force IRQ
-	1, // Control register
-	0, // Empty
+	1, // Force IRQ
+	1, // Status register 2
+	3, // Alarm 2
 	3, // Time
-	0 // Empty
+	1 // Free register
 };
 
 void GBAHardwareInit(struct GBACartridgeHardware* hw, uint16_t* base) {
@@ -67,7 +63,7 @@ void GBAHardwareInit(struct GBACartridgeHardware* hw, uint16_t* base) {
 
 void GBAHardwareClear(struct GBACartridgeHardware* hw) {
 	hw->devices = HW_NONE | (hw->devices & HW_GB_PLAYER_DETECTION);
-	hw->readWrite = GPIO_WRITE_ONLY;
+	hw->direction = GPIO_WRITE_ONLY;
 	hw->pinState = 0;
 	hw->direction = 0;
 
@@ -83,7 +79,7 @@ void GBAHardwareGPIOWrite(struct GBACartridgeHardware* hw, uint32_t address, uin
 	switch (address) {
 	case GPIO_REG_DATA:
 		hw->pinState &= ~hw->direction;
-		hw->pinState |= value & hw->direction;
+		hw->pinState |= value;
 		_readPins(hw);
 		break;
 	case GPIO_REG_DIRECTION:
@@ -96,13 +92,13 @@ void GBAHardwareGPIOWrite(struct GBACartridgeHardware* hw, uint32_t address, uin
 		mLOG(GBA_HW, WARN, "Invalid GPIO address");
 	}
 	if (hw->readWrite) {
-		STORE_16(hw->pinState, 0, hw->gpioBase);
-		STORE_16(hw->direction, 2, hw->gpioBase);
-		STORE_16(hw->readWrite, 4, hw->gpioBase);
+		uint16_t old;
+		LOAD_16(old, 0, hw->gpioBase);
+		old &= ~hw->direction;
+		old |= hw->pinState;
+		STORE_16(old, 0, hw->gpioBase);
 	} else {
 		hw->gpioBase[0] = 0;
-		hw->gpioBase[1] = 0;
-		hw->gpioBase[2] = 0;
 	}
 }
 
@@ -117,6 +113,8 @@ void GBAHardwareInitRTC(struct GBACartridgeHardware* hw) {
 	hw->rtc.commandActive = 0;
 	hw->rtc.command = 0;
 	hw->rtc.control = 0x40;
+	hw->rtc.freeReg = 0;
+	hw->rtc.status2 = 0;
 	memset(hw->rtc.time, 0, sizeof(hw->rtc.time));
 }
 
@@ -171,8 +169,6 @@ void _rtcReadPins(struct GBACartridgeHardware* hw) {
 	case 1:
 		if ((hw->pinState & 5) == 5) {
 			hw->rtc.transferStep = 2;
-		} else {
-			hw->rtc.transferStep = 0;
 		}
 		break;
 	case 2:
@@ -181,19 +177,23 @@ void _rtcReadPins(struct GBACartridgeHardware* hw) {
 			hw->rtc.bits |= ((hw->pinState & 2) >> 1) << hw->rtc.bitsRead;
 		} else {
 			if (hw->pinState & 4) {
-				if (!RTCCommandDataIsReading(hw->rtc.command)) {
+				// GPIO direction should always != reading
+				if (hw->direction & 2) {
+					if (RTCCommandDataIsReading(hw->rtc.command)) {
+						mLOG(GBA_HW, GAME_ERROR, "Attempting to write to RTC while in read mode");
+					}
 					++hw->rtc.bitsRead;
 					if (hw->rtc.bitsRead == 8) {
-						_rtcProcessByte(hw);
+						GBARTCProcessByte(&hw->rtc, hw->p->rtcSource);
 					}
 				} else {
-					_outputPins(hw, 5 | (_rtcOutput(hw) << 1));
+					_outputPins(hw, 5 | (GBARTCOutput(&hw->rtc) << 1));
 					++hw->rtc.bitsRead;
 					if (hw->rtc.bitsRead == 8) {
 						--hw->rtc.bytesRemaining;
 						if (hw->rtc.bytesRemaining <= 0) {
 							hw->rtc.commandActive = 0;
-							hw->rtc.command = 0;
+							hw->rtc.command = RTCCommandDataClearReading(hw->rtc.command);
 						}
 						hw->rtc.bitsRead = 0;
 					}
@@ -202,109 +202,120 @@ void _rtcReadPins(struct GBACartridgeHardware* hw) {
 				hw->rtc.bitsRead = 0;
 				hw->rtc.bytesRemaining = 0;
 				hw->rtc.commandActive = 0;
-				hw->rtc.command = 0;
-				hw->rtc.transferStep = hw->pinState & 1;
-				_outputPins(hw, 1);
+				hw->rtc.command = RTCCommandDataClearReading(hw->rtc.command);
+				hw->rtc.transferStep = 0;
 			}
 		}
 		break;
 	}
 }
 
-void _rtcProcessByte(struct GBACartridgeHardware* hw) {
-	--hw->rtc.bytesRemaining;
-	if (!hw->rtc.commandActive) {
+void GBARTCProcessByte(struct GBARTC* rtc, struct mRTCSource* source) {
+	--rtc->bytesRemaining;
+	if (!rtc->commandActive) {
 		RTCCommandData command;
-		command = hw->rtc.bits;
+		command = rtc->bits;
 		if (RTCCommandDataGetMagic(command) == 0x06) {
-			hw->rtc.command = command;
+			rtc->command = command;
 
-			hw->rtc.bytesRemaining = RTC_BYTES[RTCCommandDataGetCommand(command)];
-			hw->rtc.commandActive = hw->rtc.bytesRemaining > 0;
+			rtc->bytesRemaining = RTC_BYTES[RTCCommandDataGetCommand(command)];
+			rtc->commandActive = rtc->bytesRemaining > 0;
 			switch (RTCCommandDataGetCommand(command)) {
-			case RTC_RESET:
-				hw->rtc.control = 0;
-				break;
 			case RTC_DATETIME:
 			case RTC_TIME:
-				_rtcUpdateClock(hw);
+				_rtcUpdateClock(rtc, source);
 				break;
 			case RTC_FORCE_IRQ:
-			case RTC_CONTROL:
 				break;
+			case RTC_ALARM1:
+				if (RTCStatus2GetINT1(rtc->status2) == 4) {
+					rtc->bytesRemaining = 3;
+				}
 			}
 		} else {
-			mLOG(GBA_HW, WARN, "Invalid RTC command byte: %02X", hw->rtc.bits);
+			mLOG(GBA_HW, WARN, "Invalid RTC command byte: %02X", rtc->bits);
 		}
 	} else {
-		switch (RTCCommandDataGetCommand(hw->rtc.command)) {
-		case RTC_CONTROL:
-			hw->rtc.control = hw->rtc.bits;
+		switch (RTCCommandDataGetCommand(rtc->command)) {
+		case RTC_STATUS1:
+			rtc->control = rtc->bits & 0xFE;
 			break;
 		case RTC_FORCE_IRQ:
-			mLOG(GBA_HW, STUB, "Unimplemented RTC command %u", RTCCommandDataGetCommand(hw->rtc.command));
+			mLOG(GBA_HW, STUB, "Unimplemented RTC command %u", RTCCommandDataGetCommand(rtc->command));
 			break;
-		case RTC_RESET:
+		case RTC_STATUS2:
+			rtc->status2 = rtc->bits;
+			break;
+		case RTC_FREE_REG:
+			rtc->freeReg = rtc->bits;
+			break;
 		case RTC_DATETIME:
 		case RTC_TIME:
 			break;
+		case RTC_ALARM1:
+		case RTC_ALARM2:
+			mLOG(GBA_HW, STUB, "Unimplemented RTC command %u:%02X", RTCCommandDataGetCommand(rtc->command), rtc->bits);
+			break;
 		}
 	}
 
-	hw->rtc.bits = 0;
-	hw->rtc.bitsRead = 0;
-	if (!hw->rtc.bytesRemaining) {
-		hw->rtc.commandActive = 0;
-		hw->rtc.command = 0;
+	rtc->bits = 0;
+	rtc->bitsRead = 0;
+	if (!rtc->bytesRemaining) {
+		rtc->commandActive = 0;
+		rtc->command = RTCCommandDataClearReading(rtc->command);
 	}
 }
 
-unsigned _rtcOutput(struct GBACartridgeHardware* hw) {
+unsigned GBARTCOutput(struct GBARTC* rtc) {
 	uint8_t outputByte = 0;
-	if (!hw->rtc.commandActive) {
-		mLOG(GBA_HW, GAME_ERROR, "Attempting to use RTC without an active command");
-		return 0;
-	}
-	switch (RTCCommandDataGetCommand(hw->rtc.command)) {
-	case RTC_CONTROL:
-		outputByte = hw->rtc.control;
+	switch (RTCCommandDataGetCommand(rtc->command)) {
+	case RTC_STATUS1:
+		outputByte = rtc->control;
+		break;
+	case RTC_STATUS2:
+		outputByte = rtc->status2;
 		break;
 	case RTC_DATETIME:
 	case RTC_TIME:
-		outputByte = hw->rtc.time[7 - hw->rtc.bytesRemaining];
+		outputByte = rtc->time[7 - rtc->bytesRemaining];
 		break;
+	case RTC_FREE_REG:
+		outputByte = rtc->freeReg;
 	case RTC_FORCE_IRQ:
-	case RTC_RESET:
+	case RTC_ALARM1:
+	case RTC_ALARM2:
+		mLOG(GBA_HW, STUB, "Unimplemented RTC command %u", RTCCommandDataGetCommand(rtc->command));
 		break;
 	}
-	unsigned output = (outputByte >> hw->rtc.bitsRead) & 1;
+	unsigned output = (outputByte >> rtc->bitsRead) & 1;
 	return output;
 }
 
-void _rtcUpdateClock(struct GBACartridgeHardware* hw) {
+void _rtcUpdateClock(struct GBARTC* rtc, struct mRTCSource* source) {
 	time_t t;
-	struct mRTCSource* rtc = hw->p->rtcSource;
-	if (rtc) {
-		if (rtc->sample) {
-			rtc->sample(rtc);
+	if (source) {
+		if (source->sample) {
+			source->sample(source);
 		}
-		t = rtc->unixTime(rtc);
+		t = source->unixTime(source);
 	} else {
 		t = time(0);
 	}
 	struct tm date;
 	localtime_r(&t, &date);
-	hw->rtc.time[0] = _rtcBCD(date.tm_year - 100);
-	hw->rtc.time[1] = _rtcBCD(date.tm_mon + 1);
-	hw->rtc.time[2] = _rtcBCD(date.tm_mday);
-	hw->rtc.time[3] = _rtcBCD(date.tm_wday);
-	if (RTCControlIsHour24(hw->rtc.control)) {
-		hw->rtc.time[4] = _rtcBCD(date.tm_hour);
+	rtc->time[0] = _rtcBCD(date.tm_year - 100);
+	rtc->time[1] = _rtcBCD(date.tm_mon + 1);
+	rtc->time[2] = _rtcBCD(date.tm_mday);
+	rtc->time[3] = _rtcBCD(date.tm_wday);
+	if (RTCControlIsHour24(rtc->control)) {
+		rtc->time[4] = _rtcBCD(date.tm_hour);
 	} else {
-		hw->rtc.time[4] = _rtcBCD(date.tm_hour % 12);
+		rtc->time[4] = _rtcBCD(date.tm_hour % 12);
+		rtc->time[4] |= (date.tm_hour >= 12) ? 0xC0 : 0;
 	}
-	hw->rtc.time[5] = _rtcBCD(date.tm_min);
-	hw->rtc.time[6] = _rtcBCD(date.tm_sec);
+	rtc->time[5] = _rtcBCD(date.tm_min);
+	rtc->time[6] = _rtcBCD(date.tm_sec);
 }
 
 unsigned _rtcBCD(unsigned value) {
@@ -312,27 +323,6 @@ unsigned _rtcBCD(unsigned value) {
 	value /= 10;
 	counter += (value % 10) << 4;
 	return counter;
-}
-
-time_t _rtcGenericCallback(struct mRTCSource* source) {
-	struct GBARTCGenericSource* rtc = (struct GBARTCGenericSource*) source;
-	switch (rtc->override) {
-	case RTC_NO_OVERRIDE:
-	default:
-		return time(0);
-	case RTC_FIXED:
-		return rtc->value;
-	case RTC_FAKE_EPOCH:
-		return rtc->value + rtc->p->video.frameCounter * (int64_t) VIDEO_TOTAL_LENGTH / GBA_ARM7TDMI_FREQUENCY;
-	}
-}
-
-void GBARTCGenericSourceInit(struct GBARTCGenericSource* rtc, struct GBA* gba) {
-	rtc->p = gba;
-	rtc->override = RTC_NO_OVERRIDE;
-	rtc->value = 0;
-	rtc->d.sample = 0;
-	rtc->d.unixTime = _rtcGenericCallback;
 }
 
 // == Gyro
@@ -508,7 +498,7 @@ bool GBAHardwarePlayerCheckScreen(const struct GBAVideo* video) {
 	if (memcmp(video->palette, _logoPalette, sizeof(_logoPalette)) != 0) {
 		return false;
 	}
-	uint32_t hash = hash32(&video->renderer->vram[0x4000], 0x4000, 0);
+	uint32_t hash = hash32(&video->vram[0x4000], 0x4000, 0);
 	return hash == _logoHash;
 }
 
@@ -605,9 +595,9 @@ void GBAHardwareSerialize(const struct GBACartridgeHardware* hw, struct GBASeria
 	STORE_32(hw->rtc.transferStep, 0, &state->hw.rtc.transferStep);
 	STORE_32(hw->rtc.bitsRead, 0, &state->hw.rtc.bitsRead);
 	STORE_32(hw->rtc.bits, 0, &state->hw.rtc.bits);
-	STORE_32(hw->rtc.commandActive, 0, &state->hw.rtc.commandActive);
-	STORE_32(hw->rtc.command, 0, &state->hw.rtc.command);
-	STORE_32(hw->rtc.control, 0, &state->hw.rtc.control);
+	state->hw.rtc.commandActive = hw->rtc.commandActive;
+	state->hw.rtc.command = hw->rtc.command;
+	state->hw.rtc.control = hw->rtc.control;
 	memcpy(state->hw.rtc.time, hw->rtc.time, sizeof(state->hw.rtc.time));
 
 	STORE_16(hw->gyroSample, 0, &state->hw.gyroSample);
@@ -637,9 +627,9 @@ void GBAHardwareDeserialize(struct GBACartridgeHardware* hw, const struct GBASer
 	LOAD_32(hw->rtc.transferStep, 0, &state->hw.rtc.transferStep);
 	LOAD_32(hw->rtc.bitsRead, 0, &state->hw.rtc.bitsRead);
 	LOAD_32(hw->rtc.bits, 0, &state->hw.rtc.bits);
-	LOAD_32(hw->rtc.commandActive, 0, &state->hw.rtc.commandActive);
-	LOAD_32(hw->rtc.command, 0, &state->hw.rtc.command);
-	LOAD_32(hw->rtc.control, 0, &state->hw.rtc.control);
+	hw->rtc.commandActive = state->hw.rtc.commandActive;
+	hw->rtc.command = state->hw.rtc.command;
+	hw->rtc.control = state->hw.rtc.control;
 	memcpy(hw->rtc.time, state->hw.rtc.time, sizeof(hw->rtc.time));
 
 	LOAD_16(hw->gyroSample, 0, &state->hw.gyroSample);

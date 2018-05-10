@@ -83,12 +83,10 @@ bool mPythonScriptEngineLoadScript(struct mScriptEngine* se, const char* name, s
 void mPythonScriptEngineRun(struct mScriptEngine* se) {
 	struct mPythonScriptEngine* engine = (struct mPythonScriptEngine*) se;
 
-#ifdef USE_DEBUGGERS
 	struct mDebugger* debugger = mScriptBridgeGetDebugger(engine->sb);
 	if (debugger) {
 		mPythonSetDebugger(debugger);
 	}
-#endif
 
 	mPythonRunPending();
 }

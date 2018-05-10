@@ -232,8 +232,6 @@ void GBAudioWriteNR50(struct GBAudio* audio, uint8_t);
 void GBAudioWriteNR51(struct GBAudio* audio, uint8_t);
 void GBAudioWriteNR52(struct GBAudio* audio, uint8_t);
 
-void GBAudioUpdateFrame(struct GBAudio* audio, struct mTiming* timing);
-
 void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right);
 
 struct GBSerializedPSGState;
