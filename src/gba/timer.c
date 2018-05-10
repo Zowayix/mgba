@@ -44,67 +44,61 @@ static void GBATimerIrq3(struct mTiming* timing, void* context, uint32_t cyclesL
 	GBATimerIrq(context, 3);
 }
 
-void GBATimerUpdate(struct mTiming* timing, struct GBATimer* timer, uint16_t* io, uint32_t cyclesLate) {
-	*io = timer->reload;
-	int32_t currentTime = mTimingCurrentTime(timing) - cyclesLate;
+static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
+	struct GBATimer* timer = &gba->timers[timerId];
+	gba->memory.io[(REG_TM0CNT_LO >> 1) + (timerId << 1)] = timer->reload;
+	int32_t currentTime = mTimingCurrentTime(&gba->timing) - cyclesLate;
 	int32_t tickMask = (1 << GBATimerFlagsGetPrescaleBits(timer->flags)) - 1;
 	currentTime &= ~tickMask;
 	timer->lastEvent = currentTime;
-	GBATimerUpdateRegisterInternal(timer, timing, io, 0);
+	GBATimerUpdateRegister(gba, timerId, TIMER_RELOAD_DELAY + cyclesLate);
 
 	if (GBATimerFlagsIsDoIrq(timer->flags)) {
 		timer->flags = GBATimerFlagsFillIrqPending(timer->flags);
-		if (!mTimingIsScheduled(timing, &timer->irq)) {
-			mTimingSchedule(timing, &timer->irq, TIMER_IRQ_DELAY - cyclesLate);
+		if (!mTimingIsScheduled(&gba->timing, &timer->irq)) {
+			mTimingSchedule(&gba->timing, &timer->irq, TIMER_IRQ_DELAY - cyclesLate);
 		}
 	}
-}
 
-static void GBATimerUpdateAudio(struct GBA* gba, int timerId, uint32_t cyclesLate) {
-	if (!gba->audio.enable) {
-		return;
-	}
-	if ((gba->audio.chALeft || gba->audio.chARight) && gba->audio.chATimer == timerId) {
-		GBAAudioSampleFIFO(&gba->audio, 0, cyclesLate);
+	if (gba->audio.enable && timerId < 2) {
+		if ((gba->audio.chALeft || gba->audio.chARight) && gba->audio.chATimer == timerId) {
+			GBAAudioSampleFIFO(&gba->audio, 0, cyclesLate);
+		}
+
+		if ((gba->audio.chBLeft || gba->audio.chBRight) && gba->audio.chBTimer == timerId) {
+			GBAAudioSampleFIFO(&gba->audio, 1, cyclesLate);
+		}
 	}
 
-	if ((gba->audio.chBLeft || gba->audio.chBRight) && gba->audio.chBTimer == timerId) {
-		GBAAudioSampleFIFO(&gba->audio, 1, cyclesLate);
-	}
-}
-
-void GBATimerUpdateCountUp(struct mTiming* timing, struct GBATimer* nextTimer, uint16_t* io, uint32_t cyclesLate) {
-	if (GBATimerFlagsIsCountUp(nextTimer->flags)) { // TODO: Does this increment while disabled?
-		++*io;
-		if (!*io && GBATimerFlagsIsEnable(nextTimer->flags)) {
-			GBATimerUpdate(timing, nextTimer, io, cyclesLate);
+	if (timerId < 3) {
+		struct GBATimer* nextTimer = &gba->timers[timerId + 1];
+		if (GBATimerFlagsIsCountUp(nextTimer->flags)) { // TODO: Does this increment while disabled?
+			++gba->memory.io[(REG_TM1CNT_LO >> 1) + (timerId << 1)];
+			if (!gba->memory.io[(REG_TM1CNT_LO >> 1) + (timerId << 1)] && GBATimerFlagsIsEnable(nextTimer->flags)) {
+				GBATimerUpdate(gba, timerId + 1, cyclesLate);
+			}
 		}
 	}
 }
 
 static void GBATimerUpdate0(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBA* gba = context;
-	GBATimerUpdateAudio(gba, 0, cyclesLate);
-	GBATimerUpdate(timing, &gba->timers[0], &gba->memory.io[REG_TM0CNT_LO >> 1], cyclesLate);
-	GBATimerUpdateCountUp(timing, &gba->timers[1], &gba->memory.io[REG_TM1CNT_LO >> 1], cyclesLate);
+	UNUSED(timing);
+	GBATimerUpdate(context, 0, cyclesLate);
 }
 
 static void GBATimerUpdate1(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBA* gba = context;
-	GBATimerUpdateAudio(gba, 1, cyclesLate);
-	GBATimerUpdate(timing, &gba->timers[1], &gba->memory.io[REG_TM1CNT_LO >> 1], cyclesLate);
-	GBATimerUpdateCountUp(timing, &gba->timers[2], &gba->memory.io[REG_TM2CNT_LO >> 1], cyclesLate);
+	UNUSED(timing);
+	GBATimerUpdate(context, 1, cyclesLate);
 }
 
 static void GBATimerUpdate2(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBA* gba = context;
-	GBATimerUpdate(timing, &gba->timers[2], &gba->memory.io[REG_TM2CNT_LO >> 1], cyclesLate);
-	GBATimerUpdateCountUp(timing, &gba->timers[3], &gba->memory.io[REG_TM3CNT_LO >> 1], cyclesLate);
+	UNUSED(timing);
+	GBATimerUpdate(context, 2, cyclesLate);
 }
 
 static void GBATimerUpdate3(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBA* gba = context;
-	GBATimerUpdate(timing, &gba->timers[3], &gba->memory.io[REG_TM3CNT_LO >> 1], cyclesLate);
+	UNUSED(timing);
+	GBATimerUpdate(context, 3, cyclesLate);
 }
 
 void GBATimerInit(struct GBA* gba) {
@@ -145,44 +139,35 @@ void GBATimerInit(struct GBA* gba) {
 
 void GBATimerUpdateRegister(struct GBA* gba, int timer, int32_t cyclesLate) {
 	struct GBATimer* currentTimer = &gba->timers[timer];
-	if (GBATimerFlagsIsEnable(currentTimer->flags) && !GBATimerFlagsIsCountUp(currentTimer->flags)) {
-		int32_t prefetchSkew = cyclesLate;
-		if (gba->memory.lastPrefetchedPc > (uint32_t) gba->cpu->gprs[ARM_PC]) {
-			prefetchSkew += ((gba->memory.lastPrefetchedPc - gba->cpu->gprs[ARM_PC]) * gba->cpu->memory.activeSeqCycles16) / WORD_SIZE_THUMB;
-		}
-		GBATimerUpdateRegisterInternal(currentTimer, &gba->timing, &gba->memory.io[(REG_TM0CNT_LO + (timer << 2)) >> 1], prefetchSkew);
-	}
-}
-
-void GBATimerUpdateRegisterInternal(struct GBATimer* timer, struct mTiming* timing, uint16_t* io, int32_t skew) {
-	if (!GBATimerFlagsIsEnable(timer->flags) || GBATimerFlagsIsCountUp(timer->flags)) {
+	if (!GBATimerFlagsIsEnable(currentTimer->flags) || GBATimerFlagsIsCountUp(currentTimer->flags)) {
 		return;
 	}
 
-	int prescaleBits = GBATimerFlagsGetPrescaleBits(timer->flags);
-	int32_t currentTime = mTimingCurrentTime(timing) - skew;
+	int prescaleBits = GBATimerFlagsGetPrescaleBits(currentTimer->flags);
+	int32_t currentTime = mTimingCurrentTime(&gba->timing) - cyclesLate;
 	int32_t tickMask = (1 << prescaleBits) - 1;
 	currentTime &= ~tickMask;
-	int32_t tickIncrement = currentTime - timer->lastEvent;
-	timer->lastEvent = currentTime;
+	int32_t tickIncrement = currentTime - currentTimer->lastEvent;
+	currentTimer->lastEvent = currentTime;
 	tickIncrement >>= prescaleBits;
-	tickIncrement += *io;
-	*io = tickIncrement;
-	if (!mTimingIsScheduled(timing, &timer->event)) {
+	tickIncrement += gba->memory.io[(REG_TM0CNT_LO + (timer << 2)) >> 1];
+	gba->memory.io[(REG_TM0CNT_LO + (timer << 2)) >> 1] = tickIncrement;
+	if (!mTimingIsScheduled(&gba->timing, &currentTimer->event)) {
 		tickIncrement = (0x10000 - tickIncrement) << prescaleBits;
-		currentTime -= mTimingCurrentTime(timing) - skew;
-		mTimingSchedule(timing, &timer->event, TIMER_RELOAD_DELAY + tickIncrement + currentTime);
+		currentTime -= mTimingCurrentTime(&gba->timing) - cyclesLate;
+		mTimingSchedule(&gba->timing, &currentTimer->event, tickIncrement + currentTime);
 	}
 }
 
-void GBATimerWriteTMCNT_LO(struct GBATimer* timer, uint16_t reload) {
-	timer->reload = reload;
+void GBATimerWriteTMCNT_LO(struct GBA* gba, int timer, uint16_t reload) {
+	gba->timers[timer].reload = reload;
 }
 
-void GBATimerWriteTMCNT_HI(struct GBATimer* timer, struct mTiming* timing, uint16_t* io, uint16_t control) {
-	GBATimerUpdateRegisterInternal(timer, timing, io, 0);
+void GBATimerWriteTMCNT_HI(struct GBA* gba, int timer, uint16_t control) {
+	struct GBATimer* currentTimer = &gba->timers[timer];
+	GBATimerUpdateRegister(gba, timer, 0);
 
-	unsigned oldPrescale = GBATimerFlagsGetPrescaleBits(timer->flags);
+	unsigned oldPrescale = GBATimerFlagsGetPrescaleBits(currentTimer->flags);
 	unsigned prescaleBits;
 	switch (control & 0x0003) {
 	case 0x0000:
@@ -198,24 +183,23 @@ void GBATimerWriteTMCNT_HI(struct GBATimer* timer, struct mTiming* timing, uint1
 		prescaleBits = 10;
 		break;
 	}
-	prescaleBits += timer->forcedPrescale;
-	timer->flags = GBATimerFlagsSetPrescaleBits(timer->flags, prescaleBits);
-	timer->flags = GBATimerFlagsTestFillCountUp(timer->flags, timer > 0 && (control & 0x0004));
-	timer->flags = GBATimerFlagsTestFillDoIrq(timer->flags, control & 0x0040);
-	bool wasEnabled = GBATimerFlagsIsEnable(timer->flags);
-	timer->flags = GBATimerFlagsTestFillEnable(timer->flags, control & 0x0080);
-	if (!wasEnabled && GBATimerFlagsIsEnable(timer->flags)) {
-		mTimingDeschedule(timing, &timer->event);
-		*io = timer->reload;
+	currentTimer->flags = GBATimerFlagsSetPrescaleBits(currentTimer->flags, prescaleBits);
+	currentTimer->flags = GBATimerFlagsTestFillCountUp(currentTimer->flags, timer > 0 && (control & 0x0004));
+	currentTimer->flags = GBATimerFlagsTestFillDoIrq(currentTimer->flags, control & 0x0040);
+	bool wasEnabled = GBATimerFlagsIsEnable(currentTimer->flags);
+	currentTimer->flags = GBATimerFlagsTestFillEnable(currentTimer->flags, control & 0x0080);
+	if (!wasEnabled && GBATimerFlagsIsEnable(currentTimer->flags)) {
+		mTimingDeschedule(&gba->timing, &currentTimer->event);
+		gba->memory.io[(REG_TM0CNT_LO + (timer << 2)) >> 1] = currentTimer->reload;
 		int32_t tickMask = (1 << prescaleBits) - 1;
-		timer->lastEvent = (mTimingCurrentTime(timing) - TIMER_STARTUP_DELAY) & ~tickMask;
-		GBATimerUpdateRegisterInternal(timer, timing, io, TIMER_STARTUP_DELAY);
-	} else if (wasEnabled && !GBATimerFlagsIsEnable(timer->flags)) {
-		mTimingDeschedule(timing, &timer->event);
-	} else if (GBATimerFlagsIsEnable(timer->flags) && GBATimerFlagsGetPrescaleBits(timer->flags) != oldPrescale && !GBATimerFlagsIsCountUp(timer->flags)) {
-		mTimingDeschedule(timing, &timer->event);
+		currentTimer->lastEvent = (mTimingCurrentTime(&gba->timing) - TIMER_STARTUP_DELAY) & ~tickMask;
+		GBATimerUpdateRegister(gba, timer, TIMER_STARTUP_DELAY);
+	} else if (wasEnabled && !GBATimerFlagsIsEnable(currentTimer->flags)) {
+		mTimingDeschedule(&gba->timing, &currentTimer->event);
+	} else if (GBATimerFlagsIsEnable(currentTimer->flags) && GBATimerFlagsGetPrescaleBits(currentTimer->flags) != oldPrescale && !GBATimerFlagsIsCountUp(currentTimer->flags)) {
+		mTimingDeschedule(&gba->timing, &currentTimer->event);
 		int32_t tickMask = (1 << prescaleBits) - 1;
-		timer->lastEvent = (mTimingCurrentTime(timing) - TIMER_STARTUP_DELAY) & ~tickMask;
-		GBATimerUpdateRegisterInternal(timer, timing, io, TIMER_STARTUP_DELAY);
+		currentTimer->lastEvent = (mTimingCurrentTime(&gba->timing) - TIMER_STARTUP_DELAY) & ~tickMask;
+		GBATimerUpdateRegister(gba, timer, TIMER_STARTUP_DELAY);
 	}
 }

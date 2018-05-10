@@ -17,6 +17,10 @@ if(BUILD_SDL)
 	include_directories(${SDL_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src/platform/sdl)
 endif()
 
+if(POLICY CMP0071)
+	cmake_policy(SET CMP0071 OLD)
+endif()
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/input)
@@ -96,6 +100,7 @@ set(SOURCE_FILES
 	ObjView.cpp
 	OverrideView.cpp
 	PaletteView.cpp
+	PlacementControl.cpp
 	PrinterView.cpp
 	RegisterView.cpp
 	ROMInfo.cpp
@@ -133,6 +138,7 @@ set(UI_FILES
 	ObjView.ui
 	OverrideView.ui
 	PaletteView.ui
+	PlacementControl.ui
 	PrinterView.ui
 	ROMInfo.ui
 	SensorView.ui
@@ -173,7 +179,7 @@ if(Qt5Multimedia_FOUND)
 		VideoDumper.cpp)
 	if (WIN32 AND QT_STATIC)
 		list(APPEND QT_LIBRARIES Qt5::QWindowsAudioPlugin Qt5::DSServicePlugin
-                                 strmiids winmm mfuuid mfplat mf ksguid dxva2 evr d3d9)
+                                 strmiids mfuuid mfplat mf ksguid dxva2 evr d3d9)
 	endif()
 	list(APPEND QT_LIBRARIES Qt5::Multimedia)
 	list(APPEND QT_DEFINES BUILD_QT_MULTIMEDIA)
@@ -217,9 +223,6 @@ if(WIN32)
 	configure_file(${CMAKE_SOURCE_DIR}/res/win.rc.in ${CMAKE_BINARY_DIR}/res/${BINARY_NAME}.rc)
 	list(APPEND RESOURCES ${CMAKE_BINARY_DIR}/res/${BINARY_NAME}.rc)
 	set_source_files_properties(${CMAKE_BINARY_DIR}/res/${BINARY_NAME}.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/res/${BINARY_NAME}.ico)
-	if(QT_STATIC)
-		list(APPEND QT_LIBRARIES qwindows Qt5PlatformSupport imm32)
-	endif()
 endif()
 if(NOT DEFINED DATADIR)
 	if(APPLE)
@@ -275,6 +278,22 @@ set_target_properties(${BINARY_NAME}-qt PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CM
 list(APPEND QT_LIBRARIES Qt5::Widgets)
 if(BUILD_GL OR BUILD_GLES2)
 	list(APPEND QT_LIBRARIES Qt5::OpenGL ${OPENGL_LIBRARY} ${OPENGLES2_LIBRARY})
+endif()
+if(QT_STATIC)
+	find_library(QTPCRE NAMES qtpcre2 qtpcre)
+	if(WIN32)
+		list(APPEND QT_LIBRARIES qwindows dwmapi imm32 uxtheme Qt5EventDispatcherSupport Qt5FontDatabaseSupport Qt5ThemeSupport)
+		set_target_properties(Qt5::Core PROPERTIES INTERFACE_LINK_LIBRARIES "${QTPCRE};version;winmm;ws2_32")
+	elseif(APPLE)
+		find_package(Cups)
+		find_package(Qt5PrintSupport)
+		find_library(QTFREETYPE NAMES qtfreetype)
+		find_library(QTHARFBUZZ NAMES qtharfbuzzng qtharfbuzz)
+		find_library(QTPLATFORMSUPPORT NAMES Qt5PlatformSupport)
+		list(APPEND QT_LIBRARIES Cups Qt5::PrintSupport Qt5::QCocoaIntegrationPlugin Qt5::CoreAudioPlugin Qt5::AVFServicePlugin Qt5::QCocoaPrinterSupportPlugin ${QTPLATFORMSUPPORT} "-framework AVFoundation" "-framework CoreMedia")
+		set_target_properties(Qt5::Core PROPERTIES INTERFACE_LINK_LIBRARIES "${QTPCRE};${QTHARFBUZZ};${QTFREETYPE}")
+		link_directories()
+	endif()
 endif()
 target_link_libraries(${BINARY_NAME}-qt ${PLATFORM_LIBRARY} ${BINARY_NAME} ${QT_LIBRARIES})
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "${CPACK_DEBIAN_PACKAGE_DEPENDS}" PARENT_SCOPE)
